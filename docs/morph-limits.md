@@ -8,10 +8,10 @@ All figures come from sessions with Kimi K3.1 at max reasoning.
 
 | Session | Responses | Cached input tokens | Uncached input tokens | Cached share |
 |---|---:|---:|---:|---:|
-| 15 November | 223 | 113,994,240 | 1,451,319 | 98.7% |
-| The same session without its one region move | 222 | 113,994,240 | 742,396 | 99.4% |
+| 15 November | 293 | 170,322,816 | 1,655,132 | 99.0% |
+| The same session without its one region move | 292 | 170,322,816 | 946,209 | 99.4% |
 
-The 742,396 uncached tokens include the first request of the session, which has no cache. After that, a typical request carries 300 to 2,000 uncached tokens and 700,000 cached tokens.
+The 946,209 uncached tokens include the first request of the session, which has no cache. After that, a typical request carries 300 to 2,000 uncached tokens and 700,000 cached tokens.
 
 ## A run moves to another region and loses its cache
 
@@ -25,6 +25,8 @@ The cold request has the same bytes as the warm request, plus the new messages a
 | 15 Nov 09:08 | `89ad4b9a-e743-46b4-ba35-2d833926a70b` on `sf-k31` | `3379d265-07ea-435f-b415-d74902ec0f37` on `rack1` | 708,923 |
 
 The requests of 11 November had no `run_id`. The request of 15 November had one.
+
+On 15 November the run went back to `sf-k31` after 12 requests on `rack1`. The first request after the return read 707,712 cached tokens. The cache on `sf-k31` stayed alive during the move.
 
 ## The limit counts the move against the subscriber
 

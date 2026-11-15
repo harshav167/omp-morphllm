@@ -41,7 +41,7 @@ Each model accepts text and images and has a context window of 1,048,576 tokens.
 - **It keeps the request prefix byte-stable.** When you stop a turn or connect a new tool server, OMP changes bytes that it already sent. The plugin sends the original bytes.
 - **It reports the cache on every response.** The OMP log gets the cached and uncached tokens, the Ultra limit headers, and the execution region. A cache miss shows as a warning in the session.
 
-In a session on 15 November, Morph served 98.7% of 115 million input tokens from the cache.
+In a session on 15 November, Morph served 99.0% of 172 million input tokens from the cache.
 
 ## More documentation
 
