@@ -15,6 +15,10 @@ const MAX_CONVERSATIONS = 8; // First-sent system prompts kept; side requests ad
 const NOTICE_OPEN = '<system-notice source="morph-runs">';
 /** How a notice from this extension starts in serialized form. */
 const NOTICE_PREFIX = JSON.stringify({ role: "user", content: NOTICE_OPEN }).slice(0, -2);
+/** What OMP leaves in a user message from which it removed every image. */
+const IMAGE_OMITTED = "[image omitted: provider image limit]";
+/** How the tool list starts as the last item of a first-sent prefix. */
+const TOOLS_ITEM = "tools:";
 /** The models whose requests carry a run id: the Kimi models of the Ultra plan. */
 const RUN_MODELS: Record<string, true> = { "morph-kimik31": true, "morph-kimik3": true };
 
@@ -48,16 +52,20 @@ type Drop = {
 };
 
 /**
- * The system messages that a conversation was first sent with. `first` is the hash of the
- * message after them, which identifies the conversation.
+ * What a conversation was first sent with before its history. `lead` holds the serialized
+ * system messages and, as its last item, the tool list (`TOOLS_ITEM` and the serialized
+ * list). `first` is the hash of the message after the system messages, which identifies the
+ * conversation.
  */
 type Frozen = { model: string; first: string; lead: string[] };
 
 /**
- * A tool result that OMP later sent with other content. `replaced` is the hash of the later
- * form; `message` is the serialized result as it was first sent.
+ * A message that OMP later sent in another form: a tool result with other content, or a user
+ * message without some of its images. `replaced` is the hash of the later form, `after` the
+ * hash of the message before it on the wire (empty for the first message of a conversation),
+ * and `message` the serialized message as it was first sent.
  */
-type Rewrite = { model: string; replaced: string; message: string };
+type Rewrite = { model: string; replaced: string; after?: string; message: string };
 
 type Alignment = {
   /** Messages found in both lists, in order. */
@@ -118,13 +126,15 @@ function headerNumber(headers: Record<string, string>, name: string): number | u
 }
 
 /**
- * Only an assistant message without tool calls can be put back alone: it needs no tool
- * result after it, so the restored sequence is the one Morph already accepted. A notice from
- * this extension is a plain user message and can go back too.
+ * Only two kinds of message can be put back alone. An assistant message without tool calls
+ * needs no tool result after it, so the restored sequence is the one Morph already accepted.
+ * A user message with an image is one that OMP removed together with its last image. A notice
+ * from this extension is a plain user message and can go back too.
  */
 function isRestorable(serialized: string): boolean {
   if (serialized.startsWith(NOTICE_PREFIX)) return true;
   const message = asBody(JSON.parse(serialized));
+  if (message?.role === "user") return (userParts(serialized)?.images.length ?? 0) > 0;
   return (
     message?.role === "assistant" &&
     !(Array.isArray(message.tool_calls) && message.tool_calls.length > 0)
@@ -139,6 +149,78 @@ function toolCallId(serialized: string): string | undefined {
     : undefined;
 }
 
+/** The text and the other parts (images) of a serialized user message. */
+function userParts(serialized: string): { text: string; images: string[] } | undefined {
+  const message = asBody(JSON.parse(serialized));
+  if (message?.role !== "user") return undefined;
+  if (typeof message.content === "string") {
+    return { text: message.content === IMAGE_OMITTED ? "" : message.content, images: [] };
+  }
+  if (!Array.isArray(message.content)) return undefined;
+  const texts: string[] = [];
+  const images: string[] = [];
+  for (const part of message.content) {
+    const body = asBody(part);
+    const text = body?.type === "text" ? body.text : undefined;
+    if (typeof text !== "string") images.push(JSON.stringify(part));
+    else if (text !== IMAGE_OMITTED) texts.push(text);
+  }
+  return { text: texts.join("\n"), images };
+}
+
+/**
+ * True when `current` is the user message `previous` without some of its images. OMP sends
+ * a limited number of images per request and removes the oldest ones past the limit.
+ */
+function lostImages(previous: string, current: string): boolean {
+  const before = userParts(previous);
+  const after = userParts(current);
+  if (!before || !after || before.text !== after.text) return false;
+  if (after.images.length >= before.images.length) return false;
+  let kept = 0;
+  for (const image of before.images) if (after.images[kept] === image) kept++;
+  return kept === after.images.length;
+}
+
+type ToolEntry = { parameters: string; description: string };
+
+/** The tools of a Chat Completions list by name; undefined when an entry has no name. */
+function toolEntries(tools: unknown[]): Map<string, ToolEntry> | undefined {
+  const entries = new Map<string, ToolEntry>();
+  for (const tool of tools) {
+    const fn = asBody(asBody(tool)?.function);
+    if (typeof fn?.name !== "string") return undefined;
+    entries.set(fn.name, {
+      parameters: JSON.stringify(fn.parameters ?? null),
+      description: typeof fn.description === "string" ? fn.description : "",
+    });
+  }
+  return entries;
+}
+
+/**
+ * True when the list `sent` can stay on the wire for a request with the tools `current`: it
+ * declares every current tool with the same parameters. A tool that `current` lacks stays
+ * declared; a notice tells the model that it is gone.
+ */
+function declaresAll(sent: unknown[], current: unknown[]): boolean {
+  const known = toolEntries(sent);
+  const now = toolEntries(current);
+  if (!known || !now) return false;
+  for (const [name, tool] of now) {
+    if (known.get(name)?.parameters !== tool.parameters) return false;
+  }
+  return true;
+}
+
+/** The system messages and the tool list of a first-sent prefix. */
+function splitPrefix(lead: string[]): { system: string[]; tools?: unknown[] } {
+  const last = lead.at(-1);
+  if (!last?.startsWith(TOOLS_ITEM)) return { system: lead };
+  const tools: unknown = JSON.parse(last.slice(TOOLS_ITEM.length));
+  return { system: lead.slice(0, -1), tools: Array.isArray(tools) ? tools : [] };
+}
+
 function isStrings(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
@@ -151,6 +233,11 @@ function dropKey(drop: Drop): string {
   return drop.index === undefined
     ? `${drop.model}|${drop.after}|${drop.before}`
     : `${drop.model}|${drop.after}|@${drop.index}`;
+}
+
+/** The journal key of a conversation's first-sent prefix; a new tool list is a new record. */
+function leadKey(conversation: string, lead: string[]): string {
+  return `lead|${conversation}|${hashOf(lead.at(-1) ?? "")}`;
 }
 
 /** The text of serialized system messages. */
@@ -170,25 +257,66 @@ function leadText(lead: string[]): string {
   return parts.join("\n");
 }
 
+/** The lines that only one of two texts has. */
+function lineChanges(before: string, after: string): { added: string[]; removed: string[] } {
+  const beforeLines = before.split("\n");
+  const afterLines = after.split("\n");
+  const inBefore = new Set(beforeLines);
+  const inAfter = new Set(afterLines);
+  return {
+    added: afterLines.filter((line) => !inBefore.has(line)),
+    removed: beforeLines.filter((line) => !inAfter.has(line)),
+  };
+}
+
 /**
- * A serialized user message that tells the model which system-prompt lines changed between
- * `known` and `current`; undefined when no line was added or removed.
+ * A serialized user message that tells the model what changed between the prefixes `known`
+ * and `current`: system-prompt lines, tools that went away or came back, and tool
+ * descriptions. Undefined when nothing changed.
  */
 function changeNotice(known: string[], current: string[]): string | undefined {
-  const before = leadText(known).split("\n");
-  const after = leadText(current).split("\n");
-  const beforeLines = new Set(before);
-  const afterLines = new Set(after);
-  const added = after.filter((line) => !beforeLines.has(line));
-  const removed = before.filter((line) => !afterLines.has(line));
-  if (added.length === 0 && removed.length === 0) return undefined;
-  const sections = [NOTICE_OPEN, "The system instructions changed during this session."];
-  if (added.length > 0) {
-    sections.push("These lines are now part of the system instructions:", added.join("\n"));
+  const was = splitPrefix(known);
+  const now = splitPrefix(current);
+  const sections = [NOTICE_OPEN];
+  const system = lineChanges(leadText(was.system), leadText(now.system));
+  if (system.added.length > 0 || system.removed.length > 0) {
+    sections.push("The system instructions changed during this session.");
+    if (system.added.length > 0) {
+      sections.push(
+        "These lines are now part of the system instructions:",
+        system.added.join("\n"),
+      );
+    }
+    if (system.removed.length > 0) {
+      sections.push(
+        "These lines are no longer part of the system instructions:",
+        system.removed.join("\n"),
+      );
+    }
   }
-  if (removed.length > 0) {
-    sections.push("These lines are no longer part of the system instructions:", removed.join("\n"));
+  const before = was.tools && toolEntries(was.tools);
+  const after = now.tools && toolEntries(now.tools);
+  if (before && after) {
+    const gone = [...before.keys()].filter((name) => !after.has(name));
+    const back = [...after.keys()].filter((name) => !before.has(name));
+    if (gone.length > 0) {
+      sections.push(`These tools are no longer available. Do not call them: ${gone.join(", ")}`);
+    }
+    if (back.length > 0) sections.push(`These tools are available: ${back.join(", ")}`);
+    for (const [name, tool] of after) {
+      const old = before.get(name);
+      if (!old || old.description === tool.description) continue;
+      const lines = lineChanges(old.description, tool.description);
+      sections.push(`The description of the tool \`${name}\` changed.`);
+      if (lines.added.length > 0) {
+        sections.push("These lines are now part of it:", lines.added.join("\n"));
+      }
+      if (lines.removed.length > 0) {
+        sections.push("These lines are no longer part of it:", lines.removed.join("\n"));
+      }
+    }
   }
+  if (sections.length === 1) return undefined;
   sections.push("</system-notice>");
   return JSON.stringify({ role: "user", content: sections.join("\n\n") });
 }
@@ -197,6 +325,7 @@ function changeNotice(known: string[], current: string[]): string | undefined {
  * Compares the history last sent with a new request and finds what OMP changed in the part
  * that was already sent:
  * - a tool result with other content for the same call (OMP elides some results later);
+ * - a user message without some of its images (OMP removes the oldest images past its limit);
  * - a run of restorable messages that is missing, when the message that followed the run is
  *   the next message of the new request. That proves OMP removed the run and kept the
  *   conversation around it.
@@ -215,7 +344,10 @@ function align(previous: string[], current: string[]): Alignment {
       continue;
     }
     const call = toolCallId(previous[i]);
-    if (call !== undefined && call === toolCallId(current[j])) {
+    if (
+      (call !== undefined && call === toolCallId(current[j])) ||
+      lostImages(previous[i], current[j])
+    ) {
       edits.push({ at: j, from: i, to: i + 1, rewrite: true });
       i++;
       j++;
@@ -248,19 +380,23 @@ function align(previous: string[], current: string[]): Alignment {
  * the id on purpose: they carry the same prefix and belong on the same worker.
  *
  * Wire history: Morph's cache matches a request from its first byte, so a message that was
- * sent must stay as it was. At a new prompt OMP changes the part already sent: it leaves out
+ * sent must stay as it was. OMP changes the part already sent: at a new prompt it leaves out
  * an interrupted assistant reply and replaces some tool results (for example with
- * `[Uneventful result elided]`). Either change ends the cached prefix at that message. This
- * extension keeps the histories it sent, puts a dropped reply back at its place and gives a
- * rewritten tool result its first form back. The changes are journaled per session, so a
- * resumed process applies them too. A compaction starts a new history.
+ * `[Uneventful result elided]`), and when the model reads an image it removes the oldest
+ * images past its per-request limit, which are the frames of the compaction summary first.
+ * Each change ends the cached prefix at that message. This extension keeps the histories it
+ * sent, puts a dropped message back at its place and gives a changed message its first form
+ * back. The changes are journaled per session, so a resumed process applies them too. A
+ * compaction starts a new history.
  *
- * System prompt: OMP rebuilds the system prompt during a session, for example when the list
- * of mounted devices changes. The system prompt is the first bytes of every request, so a
- * change there makes the whole request uncached. This extension keeps the system messages
- * that a conversation was first sent with, and sends the changed lines once as a
- * `<system-notice>` user message at the end of the history. The new system prompt takes
- * effect on the wire after the next compaction.
+ * System prompt and tools: OMP rebuilds the system prompt and the tool list during a
+ * session, for example when the list of mounted devices changes or a mode adds a tool. Both
+ * are the first bytes of every request, so a change there makes the whole request uncached.
+ * This extension keeps the system messages and the tool list that a conversation was first
+ * sent with, and sends what changed once as a `<system-notice>` user message at the end of
+ * the history. A tool that is new, or has new parameters, must be declared: then the current
+ * tool list goes on the wire. The new system prompt takes effect on the wire after the next
+ * compaction.
  *
  * Telemetry: each Morph response is logged with its headers (Ultra limits, backend), each
  * assistant message with its cached and uncached input tokens, and a change of the system
@@ -341,13 +477,14 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
           entry ?? {};
         if (typeof model !== "string") continue;
         if (typeof replaced === "string" && typeof message === "string") {
-          const key = `${model}|${replaced}`;
+          const key =
+            typeof after === "string" ? `${model}|${replaced}|${after}` : `${model}|${replaced}`;
           journaled.add(`${owner}|${key}`);
           rewrites.set(key, message);
           continue;
         }
         if (typeof first === "string" && isStrings(lead)) {
-          journaled.add(`${owner}|lead|${model}|${first}`);
+          journaled.add(`${owner}|${leadKey(`${model}|${first}`, lead)}`);
           frozen.set(`${model}|${first}`, lead);
           continue;
         }
@@ -382,18 +519,21 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
     };
 
     /**
-     * Returns the message list to send when it differs from `messages`, and records the list
-     * as the history last sent. Messages are compared and restored in serialized form, so a
-     * restored message has the bytes it had on the wire before.
+     * Returns the message list and the tool list to send where they differ from the
+     * request's own, and records the message list as the history last sent. Messages are
+     * compared and restored in serialized form, so a restored message has the bytes it had
+     * on the wire before.
      */
     const restoreHistory = (
       model: string,
       owner: string,
       messages: unknown[],
-    ): unknown[] | undefined => {
+      tools: unknown,
+    ): { messages?: unknown[]; tools?: unknown[] } => {
       readJournal(owner);
       const objects = [...messages];
       const strings = objects.map((message) => JSON.stringify(message));
+      const sent = histories.get(model) ?? [];
       let restored = 0;
       const insert = (at: number, serialized: string[]): void => {
         strings.splice(at, 0, ...serialized);
@@ -401,20 +541,59 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
         restored += serialized.length;
       };
 
-      // The system messages stay as this conversation first sent them. A conversation is
-      // known by the message after them, so a side request with its own prompt is left alone.
       let leadCount = 0;
       while (leadCount < objects.length) {
         const role = asBody(objects[leadCount])?.role;
         if (role !== "system" && role !== "developer") break;
         leadCount++;
       }
-      const currentLead = strings.slice(0, leadCount);
-      let knownLead: string[] | undefined;
+      /** Gives the message at `at` its first form back and keeps the pair for later requests. */
+      const putBack = (at: number, original: string): void => {
+        const replaced = hashOf(strings[at]);
+        const after = at <= leadCount ? "" : hashOf(strings[at - 1]);
+        const key = `${model}|${replaced}|${after}`;
+        rewrites.set(key, original);
+        journal(owner, key, { model, replaced, after, message: original });
+        strings[at] = original;
+        objects[at] = JSON.parse(original);
+        restored++;
+      };
+
+      // The message after the system messages identifies the conversation, so it gets its
+      // first form back before the conversation is looked up.
       if (leadCount > 0 && leadCount < strings.length) {
-        const first = hashOf(strings[leadCount]);
-        const conversation = `${model}|${first}`;
+        const current = strings[leadCount];
+        const original =
+          rewrites.get(`${model}|${hashOf(current)}|`) ??
+          sent
+            .map((history) => history[leadCount])
+            .find((previous) => previous !== undefined && lostImages(previous, current));
+        if (original !== undefined) putBack(leadCount, original);
+      }
+
+      // The system messages and the tool list stay as this conversation first sent them. A
+      // side request with its own prompt is another conversation and is left alone. A request
+      // without tools keeps none.
+      const currentTools = Array.isArray(tools) && tools.length > 0 ? tools : undefined;
+      const currentToolsItem =
+        currentTools === undefined ? undefined : TOOLS_ITEM + JSON.stringify(currentTools);
+      const currentLead = strings.slice(0, leadCount);
+      if (currentToolsItem !== undefined) currentLead.push(currentToolsItem);
+      let knownLead: string[] | undefined;
+      let wireTools: unknown[] | undefined;
+      let toolsAdopted = false;
+      if (leadCount > 0 && leadCount < strings.length) {
+        const conversation = `${model}|${hashOf(strings[leadCount])}`;
         knownLead = frozen.get(conversation);
+        if (knownLead && currentTools && currentToolsItem !== undefined) {
+          const known = splitPrefix(knownLead);
+          if (known.tools && declaresAll(known.tools, currentTools)) {
+            if (knownLead.at(-1) !== currentToolsItem) wireTools = known.tools;
+          } else {
+            knownLead = [...known.system, currentToolsItem];
+            toolsAdopted = true;
+          }
+        }
         frozen.delete(conversation); // Set again below, so the newest use is evicted last.
         frozen.set(conversation, knownLead ?? currentLead);
         if (frozen.size > MAX_CONVERSATIONS) {
@@ -422,35 +601,39 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
           if (oldest !== undefined) frozen.delete(oldest);
         }
         if (knownLead) {
-          journal(owner, `lead|${conversation}`, { model, first, lead: knownLead });
-          if (!sameStrings(knownLead, currentLead)) {
-            strings.splice(0, leadCount, ...knownLead);
-            objects.splice(0, leadCount, ...knownLead.map((text): unknown => JSON.parse(text)));
+          journal(owner, leadKey(conversation, knownLead), {
+            model,
+            first: hashOf(strings[leadCount]),
+            lead: knownLead,
+          });
+          const system = splitPrefix(knownLead).system;
+          if (!sameStrings(system, strings.slice(0, leadCount))) {
+            strings.splice(0, leadCount, ...system);
+            objects.splice(0, leadCount, ...system.map((text): unknown => JSON.parse(text)));
             restored++;
           }
         }
       }
 
-      // Known changes next: a rewritten tool result gets its first form back, then each
-      // dropped run goes back where it was.
-      const known = drops.filter((drop) => drop.model === model);
-      if (known.length > 0 || rewrites.size > 0) {
+      // Known changes: a changed message gets its first form back and each dropped run goes
+      // back where it was. A restored message can be the neighbour that another change is
+      // found by, so repeat until nothing goes back.
+      const pending = new Set(drops.filter((drop) => drop.model === model));
+      const applyKnown = (): void => {
+        if (pending.size === 0 && rewrites.size === 0) return;
         const hashes = strings.map(hashOf);
-        for (let j = 0; j < hashes.length; j++) {
-          const key = `${model}|${hashes[j]}`;
-          const original = rewrites.get(key);
-          if (original === undefined) continue;
-          journal(owner, key, { model, replaced: hashes[j], message: original });
-          strings[j] = original;
-          objects[j] = JSON.parse(original);
-          hashes[j] = hashOf(original);
-          restored++;
-        }
-        // A restored run can be the neighbour that another run is found by, so repeat until
-        // no run goes back.
-        const pending = new Set(known);
         for (let applied = true; applied;) {
           applied = false;
+          for (let j = 0; rewrites.size > 0 && j < hashes.length; j++) {
+            const after = j <= leadCount ? "" : hashes[j - 1];
+            const original =
+              rewrites.get(`${model}|${hashes[j]}|${after}`) ??
+              rewrites.get(`${model}|${hashes[j]}`);
+            if (original === undefined) continue;
+            putBack(j, original);
+            hashes[j] = hashOf(original);
+            applied = true;
+          }
           for (const drop of pending) {
             let at = -1;
             if (drop.index !== undefined) {
@@ -473,34 +656,31 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
             applied = true;
           }
         }
-      }
+      };
+      const closest = (): { index: number; alignment: Alignment } | undefined => {
+        let best: { index: number; alignment: Alignment } | undefined;
+        for (let index = 0; index < sent.length; index++) {
+          const alignment = align(sent[index], strings);
+          if (!best || alignment.matched >= best.alignment.matched) best = { index, alignment };
+        }
+        return best && best.alignment.matched > 0 ? best : undefined;
+      };
 
-      // New drops: compare with the histories sent before. Several are kept because a side
-      // request to the same model must not replace the main loop's history.
-      const sent = histories.get(model) ?? [];
-      let best: { index: number; alignment: Alignment } | undefined;
-      for (let index = 0; index < sent.length; index++) {
-        const alignment = align(sent[index], strings);
-        if (!best || alignment.matched >= best.alignment.matched) best = { index, alignment };
-      }
-      let shared: number | undefined;
-      if (best && best.alignment.matched > 0) {
+      // New changes: compare with the histories sent before. Several are kept because a side
+      // request to the same model must not replace the main loop's history. A message that
+      // goes back can bring a known change into reach, so compare again after each round.
+      applyKnown();
+      let best = closest();
+      while (best && best.alignment.edits.length > 0) {
         const previous = sent[best.index];
-        const { edits, next } = best.alignment;
+        const { edits } = best.alignment;
         let offset = 0;
         let dropped = 0;
         let rewritten = 0;
         for (const edit of edits) {
           const at = edit.at + offset;
           if (edit.rewrite) {
-            const original = previous[edit.from];
-            const replaced = hashOf(strings[at]);
-            const key = `${model}|${replaced}`;
-            rewrites.set(key, original);
-            journal(owner, key, { model, replaced, message: original });
-            strings[at] = original;
-            objects[at] = JSON.parse(original);
-            restored++;
+            putBack(at, previous[edit.from]);
             rewritten++;
             continue;
           }
@@ -523,15 +703,20 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
           }
           journal(owner, key, drop);
         }
-        if (edits.length > 0) {
-          pi.logger.warn("Morph history restored", {
-            model,
-            firstIndex: edits[0].at,
-            dropped,
-            rewritten,
-          });
-        }
-        shared = best.alignment.shared + offset;
+        pi.logger.warn("Morph history restored", {
+          model,
+          firstIndex: edits[0].at,
+          dropped,
+          rewritten,
+        });
+        applyKnown();
+        best = closest();
+      }
+      let shared: number | undefined;
+      if (best) {
+        const previous = sent[best.index];
+        const { next } = best.alignment;
+        shared = best.alignment.shared;
         if (next === previous.length) {
           sent.splice(best.index, 1);
         } else {
@@ -549,8 +734,8 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
         }
       }
 
-      // The model learns of a changed system prompt from a notice at the end of the history.
-      // There it costs only its own tokens. `told` is the system prompt the model knows.
+      // The model learns of a changed system prompt or tool list from a notice at the end of
+      // the history. There it costs only its own tokens. `told` is the prefix the model knows.
       if (knownLead) {
         let told = knownLead;
         for (let j = strings.length - 1; j >= 0 && noticeLeads.size > 0; j--) {
@@ -560,7 +745,17 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
             break;
           }
         }
-        const notice = sameStrings(told, currentLead) ? undefined : changeNotice(told, currentLead);
+        // The model sees a tool list that went on the wire, so no notice describes it.
+        if (toolsAdopted && currentToolsItem !== undefined) {
+          told = [...splitPrefix(told).system, currentToolsItem];
+        }
+        // A request without tools says nothing about the tools the model knows.
+        const toldTools = told.at(-1)?.startsWith(TOOLS_ITEM) ? told.at(-1) : undefined;
+        const now =
+          currentToolsItem === undefined && toldTools !== undefined
+            ? [...currentLead, toldTools]
+            : currentLead;
+        const notice = sameStrings(told, now) ? undefined : changeNotice(told, now);
         if (notice !== undefined) {
           const index = strings.length;
           const drop: Drop = {
@@ -569,14 +764,14 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
             before: "",
             messages: [notice],
             index,
-            lead: currentLead,
+            lead: now,
           };
           insert(index, [notice]);
-          noticeLeads.set(notice, currentLead);
+          noticeLeads.set(notice, now);
           dropKeys.add(dropKey(drop));
           drops.push(drop);
           journal(owner, dropKey(drop), drop);
-          pi.logger.warn("Morph system prompt change sent as a notice", {
+          pi.logger.warn("Morph prefix change sent as a notice", {
             model,
             index,
             noticeChars: notice.length,
@@ -597,7 +792,7 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
       sent.push(strings);
       if (sent.length > MAX_HISTORIES) sent.shift();
       histories.set(model, sent);
-      return restored > 0 ? objects : undefined;
+      return { messages: restored > 0 ? objects : undefined, tools: wireTools };
     };
 
     const release = (target: Run): Promise<void> => {
@@ -683,8 +878,9 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
 
       let next = body;
       if (Array.isArray(body.messages)) {
-        const messages = restoreHistory(body.model, owner, body.messages);
-        if (messages) next = { ...next, messages };
+        const restored = restoreHistory(body.model, owner, body.messages, body.tools);
+        if (restored.messages) next = { ...next, messages: restored.messages };
+        if (restored.tools) next = { ...next, tools: restored.tools };
       }
 
       // This reports what goes on the wire. A side request with its own system prompt or

@@ -256,6 +256,120 @@ test("keeps the first system prompt on the wire and sends a change as one notice
   expect((await h.request({ messages: side }))?.messages).toEqual(side);
 });
 
+const image = (name: string) => ({
+  type: "image_url",
+  image_url: { url: `data:image/png;base64,${name}` },
+});
+const text = (value: string) => ({ type: "text", text: value });
+
+test("gives a message its removed images back, with the system prompt it was sent with", async () => {
+  const h = harness();
+  const summary = { role: "user", content: [text("archive"), image("a"), image("b")] };
+  const shot = { role: "user", content: [text("Attached image(s) from tool result:"), image("c")] };
+  const loop = [system, summary, toolCall, toolResult, shot, answer];
+  await h.request({ messages: loop });
+
+  // A new image arrives. OMP removes the oldest one, which is in the first message, and it
+  // rebuilt the system prompt in the same request.
+  const rebuilt = { role: "system", content: "stable system prompt\n- xd://new_device" };
+  const evicted = { role: "user", content: [text("archive"), image("b")] };
+  const newShot = {
+    role: "user",
+    content: [text("Attached image(s) from tool result:"), image("d")],
+  };
+  const next = [rebuilt, evicted, toolCall, toolResult, shot, answer, newShot];
+  const wire = (await h.request({ messages: next }))?.messages as RecordValue[];
+  expect(wire.slice(0, 7)).toEqual([...loop, newShot]);
+  expect(wire).toHaveLength(8);
+  expect(wire[7].content).toContain("- xd://new_device");
+
+  // The message that held only the removed image is gone from OMP's request; so is the
+  // last image of the first message.
+  const bare = { role: "user", content: [text("archive")] };
+  const later = [rebuilt, bare, toolCall, toolResult, answer, newShot, nextPrompt];
+  const expected = [...wire, nextPrompt];
+  expect((await h.request({ messages: later }))?.messages).toEqual(expected);
+  const resumed = harness(60_000, h.journalDir);
+  expect((await resumed.request({ messages: later }))?.messages).toEqual(expected);
+});
+
+test("restores each image to its own message when two messages have the same text", async () => {
+  const h = harness();
+  const one = { role: "user", content: [text("fix this"), image("a")] };
+  const two = { role: "user", content: [text("fix this"), image("b")] };
+  const fixed = { role: "assistant", content: "fixed" };
+  const loop = [system, task, answer, one, fixed, two, answer];
+  await h.request({ messages: loop });
+  // Without their images the two messages are the same; the message before each one differs.
+  const bare = { role: "user", content: "fix this" };
+  const rebuilt = [system, task, answer, bare, fixed, bare, answer, nextPrompt];
+  const expected = [...loop, nextPrompt];
+  expect((await h.request({ messages: rebuilt }))?.messages).toEqual(expected);
+  const resumed = harness(60_000, h.journalDir);
+  expect((await resumed.request({ messages: rebuilt }))?.messages).toEqual(expected);
+});
+
+const tool = (name: string, description: string, parameters: RecordValue = {}) => ({
+  type: "function",
+  function: { name, description, parameters },
+});
+
+test("keeps the first tool list on the wire and sends a change as one notice", async () => {
+  const h = harness();
+  const read = tool("read", "Reads a file.");
+  const plan = tool("plan", "Submits a plan.");
+  const sent = [read, plan];
+  const loop = [system, task, toolCall, toolResult];
+  await h.request({ messages: loop, tools: sent });
+
+  // A mode ends and takes its tool away, and a description is rebuilt.
+  const current = [tool("read", "Reads a file.\nReads devices too.")];
+  const changed = await h.request({ messages: [...loop, answer], tools: current });
+  expect(changed?.tools).toEqual(sent);
+  const wire = changed?.messages as RecordValue[];
+  expect(wire).toHaveLength(6);
+  expect(wire[5].content).toContain("no longer available. Do not call them: plan");
+  expect(wire[5].content).toContain("Reads devices too.");
+  expect(h.warnings.map((warning) => warning[0])).toEqual(["Morph prefix change sent as a notice"]);
+
+  // Later requests and a resumed process send the same bytes; the notice is not repeated.
+  const later = { messages: [...loop, answer, nextPrompt], tools: current };
+  const expected = [...wire, nextPrompt];
+  const second = await h.request(later);
+  expect(second?.tools).toEqual(sent);
+  expect(second?.messages).toEqual(expected);
+  const resumed = harness(60_000, h.journalDir);
+  const afterResume = await resumed.request(later);
+  expect(afterResume?.tools).toEqual(sent);
+  expect(afterResume?.messages).toEqual(expected);
+
+  // A request without tools gets none.
+  const bare = await h.request({ messages: [...loop, answer, nextPrompt], tools: undefined });
+  expect(bare?.tools).toBeUndefined();
+});
+
+test("a new tool or new parameters put the current tool list on the wire", async () => {
+  const h = harness();
+  const read = tool("read", "Reads a file.");
+  await h.request({ messages: [system, task], tools: [read] });
+
+  const withWrite = [read, tool("write", "Writes a file.")];
+  const added = await h.request({ messages: [system, task, answer], tools: withWrite });
+  expect(added?.tools).toEqual(withWrite);
+  expect(added?.messages).toEqual([system, task, answer]);
+
+  // The new list is now the one that stays.
+  const removed = await h.request({ messages: [system, task, answer, nextPrompt], tools: [read] });
+  expect(removed?.tools).toEqual(withWrite);
+
+  const reshaped = [tool("read", "Reads a file.", { type: "object" })];
+  const changed = await h.request({
+    messages: [system, task, answer, nextPrompt],
+    tools: reshaped,
+  });
+  expect(changed?.tools).toEqual(reshaped);
+});
+
 test("after a compaction the current system prompt goes on the wire", async () => {
   const h = harness();
   const rebuilt = { role: "system", content: "rebuilt system prompt" };
