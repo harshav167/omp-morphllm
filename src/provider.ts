@@ -7,7 +7,7 @@ const API_KEYS_URL = "https://www.morphllm.com/dashboard/api-keys";
 
 /**
  * `supportsPromptCacheKey` is in OMP's compat vocabulary (pi-catalog `compat/axes.ts`) and
- * `models.yml` accepts it, but OMP 18.20 does not declare it in the TypeScript type.
+ * `models.yml` accepts it, but OMP's TypeScript type does not declare it (18.20 and 19.0).
  */
 type Compat = NonNullable<ProviderModelConfig["compat"]> & { supportsPromptCacheKey?: boolean };
 
