@@ -10,13 +10,7 @@ Every Kimi request of a session carries `run_id: omp-<session id>`. Morph gives 
 
 The id does not change during tool turns, retries, side requests, follow-up prompts, rewinds, branches, or a restarted process. Side requests share the id because they carry the same prefix.
 
-The plugin releases the run with Morph's final request (`run_final: true`) in three cases:
-
-- You switch to another session.
-- OMP exits.
-- The agent is idle for 10 minutes.
-
-Morph reclaims an idle run after 15 minutes. That reclaim covers a process that stops without a release.
+The plugin never ends a run. Up to 19 November it sent a release request after 10 idle minutes, at a session switch, and when OMP exited: an empty request with the session's `x-session-id`, the `run_id`, and `run_final: true`. In the logs of 14 to 19 November, 12 release requests were followed by another request of the same session, and 7 of those requests had no cached tokens. One came 38 seconds after the release and read 0 of 276,184 tokens from the cache. When Morph rejected the release with a `429`, the cache stayed valid in 3 of 4 cases, for up to 270 minutes. How the release lost the cache is not known: on 17 November Morph said that its gateway drops `run_id`.
 
 The plugin leaves a request unchanged when the request already has a `run_id` or a `program_id`.
 

@@ -2,12 +2,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
 import { MORPH_BASE_URL, MORPH_PROVIDER } from "./provider";
 
-const ENDPOINT = `${MORPH_BASE_URL}/chat/completions`;
-const RELEASE_TIMEOUT_MS = 1500; // session_shutdown handlers have a 2s budget.
-const IDLE_RELEASE_MS = 10 * 60_000; // Morph reclaims an idle run by itself at 15 minutes.
 const CACHE_MISS_MIN_TOKENS = 16_384; // Below this an uncached input is an ordinary new turn.
 const CACHE_MISS_SHARE_MARGIN = 0.25; // Cached share may fall this far below the expected share.
 const STALL_NOTICE_MS = 20_000; // A Morph request without a response this long gets a notice.
@@ -27,15 +23,8 @@ const KIMI_MODELS: Record<string, true> = { "morph-kimik31": true, "morph-kimik3
 
 type Body = Record<string, unknown>;
 
-type Run = {
-  id: string;
-  owner: string;
-  model: Model;
-  wireModel: string;
-  cacheKey?: string;
-  registry: ExtensionContext["modelRegistry"];
-  closing?: Promise<void>;
-};
+/** The Morph run of a conversation: `owner` is the session whose requests carry `id`. */
+type Run = { id: string; owner: string };
 
 type Quota = { limit?: number; remaining?: number; burst?: string; burstRemaining?: number };
 
@@ -85,7 +74,6 @@ type Alignment = {
 };
 
 export interface MorphRunsOptions {
-  idleReleaseMs?: number;
   journalDir?: string;
 }
 
@@ -475,6 +463,8 @@ function align(previous: string[], current: string[]): Alignment {
  * while the session's prefix is cached: it stays the same across tool turns, retries, side
  * requests, follow-up prompts, rewinds, branches, and a resumed process. Side requests share
  * the id on purpose: they carry the same prefix and belong on the same worker.
+ * No release request (`run_final`) is sent: after one, the next request of the session was
+ * uncached in 7 of 12 logged cases (see docs/cache.md).
  *
  * Wire history: Morph's cache matches a request from its first byte, so a message that was
  * sent must stay as it was. OMP changes the part already sent: at a new prompt it leaves out
@@ -500,8 +490,6 @@ function align(previous: string[], current: string[]): Alignment {
  * messages or tool list between two requests is logged as a prefix change.
  */
 export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: ExtensionAPI) => void {
-  const idleReleaseMs = options?.idleReleaseMs ?? IDLE_RELEASE_MS;
-
   return function morphRuns(pi: ExtensionAPI): void {
     pi.setLabel("Morph Agent Runs");
     // The host's agent directory, so each profile keeps its own journals.
@@ -509,7 +497,6 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
     // Factories are rebound per session; never share state at module scope.
     let run: Run | undefined;
     let adoptOwner = false;
-    let idleTimer: Timer | undefined;
     let quota: Quota = {};
     let assistantTurns = 0;
     let prefixChangedSinceUsage = false;
@@ -527,12 +514,6 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
     const dropKeys = new Set<string>();
     const journaled = new Set<string>();
     const journalsRead = new Set<string>();
-
-    const clearIdleTimer = (): void => {
-      if (idleTimer === undefined) return;
-      clearTimeout(idleTimer);
-      idleTimer = undefined;
-    };
 
     const showStatus = (ctx: ExtensionContext, text: string | undefined): void => {
       if (ctx.hasUI) ctx.ui.setStatus("morph", text);
@@ -921,79 +902,14 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
       return { messages: restored > 0 ? objects : undefined, tools: wireTools };
     };
 
-    const release = (target: Run): Promise<void> => {
-      if (target.closing) return target.closing;
-      if (run === target) {
-        run = undefined;
-        clearIdleTimer();
-      }
-      target.closing = (async () => {
-        const signal = AbortSignal.timeout(RELEASE_TIMEOUT_MS);
-        try {
-          const apiKey = await target.registry.getApiKey(target.model, target.owner);
-          signal.throwIfAborted();
-          const headers = new Headers(target.model.headers);
-          if (!headers.has("authorization")) {
-            if (typeof apiKey !== "string" || !apiKey || apiKey === "N/A")
-              throw new Error("No Morph credential available");
-            headers.set("authorization", `Bearer ${apiKey}`);
-          }
-          headers.set("content-type", "application/json");
-          if (target.cacheKey && !headers.has("x-session-id"))
-            headers.set("x-session-id", target.cacheKey);
-          const response = await wrapFetchForExtraCa(globalThis.fetch)(ENDPOINT, {
-            method: "POST",
-            headers,
-            redirect: "error",
-            signal,
-            body: JSON.stringify({
-              model: target.wireModel,
-              messages: [{ role: "user", content: "" }],
-              run_id: target.id,
-              run_final: true,
-            }),
-          });
-          await response.body?.cancel();
-          if (!response.ok) {
-            pi.logger.warn("Morph run release rejected; Morph's idle reclaim is the backstop", {
-              runId: target.id,
-              status: response.status,
-            });
-            return;
-          }
-          pi.logger.debug("Morph run released", { runId: target.id });
-        } catch {
-          // Never log headers, credentials, or an HTTP error body that contains request data.
-          pi.logger.warn("Morph run release failed; Morph's idle reclaim is the backstop", {
-            runId: target.id,
-          });
-        }
-      })();
-      return target.closing;
-    };
-
-    const releaseNow = async (): Promise<void> => {
-      clearIdleTimer();
+    // Another session is another conversation: its requests carry their own run id.
+    const startSession = (): void => {
       clearStallTimer();
+      run = undefined;
       prefixes.clear();
       assistantTurns = 0;
       prefixChangedSinceUsage = false;
       adoptOwner = false;
-      if (run) await release(run);
-    };
-
-    const armIdleRelease = (ctx: ExtensionContext): void => {
-      clearIdleTimer();
-      if (!run || idleReleaseMs <= 0) return;
-      const target = run;
-      idleTimer = setTimeout(() => {
-        idleTimer = undefined;
-        if (run !== target) return;
-        // A long tool call or a long stream is not idle: keep the run until the agent stops.
-        if (ctx.isIdle()) void release(target);
-        else armIdleRelease(ctx);
-      }, idleReleaseMs);
-      idleTimer.unref?.();
     };
 
     pi.on("before_provider_request", (event, ctx) => {
@@ -1043,25 +959,13 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
       if (run && run.owner !== owner) {
         // A branch (a rewind is one) keeps its prefix up to the cut, so it keeps the run.
         if (adoptOwner) run.owner = owner;
-        else void release(run);
+        else run = undefined;
       }
       adoptOwner = false;
-      const cacheKey =
-        typeof body.prompt_cache_key === "string" ? body.prompt_cache_key : undefined;
       if (!run) {
-        run = {
-          id: `omp-${owner}`,
-          owner,
-          model,
-          wireModel: body.model,
-          cacheKey,
-          registry: ctx.modelRegistry,
-        };
+        run = { id: `omp-${owner}`, owner };
         pi.logger.debug("Morph run scheduled", { runId: run.id, model: body.model });
-      } else if (cacheKey) {
-        run.cacheKey = cacheKey;
       }
-      armIdleRelease(ctx);
       return { ...next, run_id: run.id };
     });
 
@@ -1144,10 +1048,7 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
       }
     });
 
-    pi.on("agent_end", (_event, ctx) => {
-      stopWaiting(ctx);
-      armIdleRelease(ctx);
-    });
+    pi.on("agent_end", (_event, ctx) => stopWaiting(ctx));
 
     // After a compaction OMP sends a new history on purpose. Nothing that was sent before
     // applies to it, and the current system prompt goes on the wire.
@@ -1170,7 +1071,7 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
     pi.on("session_branch", () => {
       adoptOwner = true;
     });
-    pi.on("session_switch", () => releaseNow());
-    pi.on("session_shutdown", () => releaseNow());
+    pi.on("session_switch", () => startSession());
+    pi.on("session_shutdown", () => clearStallTimer());
   };
 }

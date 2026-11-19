@@ -28,14 +28,10 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
 });
 
-function harness(
-  idleReleaseMs = 60_000,
-  journalDir = fs.mkdtempSync(path.join(os.tmpdir(), "morph-wire-")),
-) {
+function harness(journalDir = fs.mkdtempSync(path.join(os.tmpdir(), "morph-wire-"))) {
   const handlers = new Map<string, Handler[]>();
   const warnings: unknown[][] = [];
-  // `releases` counts started releases: a release reads the credential before it sends.
-  const state = { owner: "session-a", idle: true, releases: 0, hasUI: false };
+  const state = { owner: "session-a", hasUI: false };
   const statuses: (string | undefined)[] = [];
   const notices: string[] = [];
   const model = { provider: "morph", id: "morph-kimik31", baseUrl: "https://api.morphllm.com/v1" };
@@ -48,17 +44,10 @@ function harness(
       setStatus: (_key: string, text: string | undefined) => statuses.push(text),
       notify: (text: string) => notices.push(text),
     },
-    modelRegistry: {
-      getApiKey: async () => {
-        state.releases++;
-        return "fixture-credential";
-      },
-    },
     sessionManager: { getSessionId: () => state.owner },
-    isIdle: () => state.idle,
   } as unknown as ExtensionContext;
 
-  createMorphRunsExtension({ idleReleaseMs, journalDir })({
+  createMorphRunsExtension({ journalDir })({
     setLabel() {},
     on(name: string, handler: Handler) {
       handlers.set(name, [...(handlers.get(name) ?? []), handler]);
@@ -120,24 +109,21 @@ test("leaves other models and caller-owned run fields unchanged", async () => {
   ).toBeUndefined();
 });
 
-test("a rewind keeps the run; shutdown releases it with the documented final request", async () => {
-  const h = harness();
-  await h.request();
-  await h.emit("session_tree");
-  expect(requests).toHaveLength(0);
-  expect((await h.request())?.run_id).toBe("omp-session-a");
-
-  await h.emit("session_shutdown");
-  expect(requests).toHaveLength(1);
-  expect(requests[0].url).toBe("https://api.morphllm.com/v1/chat/completions");
-  expect(requests[0].body).toEqual({
-    model: "morph-kimik31",
-    messages: [{ role: "user", content: "" }],
-    run_id: "omp-session-a",
-    run_final: true,
-  });
-  expect(requests[0].headers.get("authorization")).toBe("Bearer fixture-credential");
-  expect(requests[0].headers.get("x-session-id")).toBe("stable-cache-key");
+test("nothing ends the run: a pause, a rewind, and a shutdown send nothing to Morph", async () => {
+  jest.useFakeTimers();
+  try {
+    const h = harness();
+    await h.request();
+    await h.emit("agent_end");
+    // A final request would drop the run's cache on Morph; the next prompt can come much later.
+    jest.advanceTimersByTime(60 * 60_000);
+    await h.emit("session_tree");
+    expect((await h.request())?.run_id).toBe("omp-session-a");
+    await h.emit("session_shutdown");
+    expect(requests).toHaveLength(0);
+  } finally {
+    jest.useRealTimers();
+  }
 });
 
 test("a branch keeps the run id of the conversation it continues", async () => {
@@ -146,6 +132,15 @@ test("a branch keeps the run id of the conversation it continues", async () => {
   h.state.owner = "session-b";
   await h.emit("session_branch");
   expect((await h.request())?.run_id).toBe("omp-session-a");
+  expect(requests).toHaveLength(0);
+});
+
+test("another session gets its own run id, and the switch sends nothing", async () => {
+  const h = harness();
+  await h.request();
+  h.state.owner = "session-b";
+  await h.emit("session_switch");
+  expect((await h.request())?.run_id).toBe("omp-session-b");
   expect(requests).toHaveLength(0);
 });
 
@@ -212,7 +207,7 @@ test("a resumed process restores from the session journal", async () => {
   await first.request({ messages: loop });
   await first.request({ messages: rebuilt });
 
-  const resumed = harness(60_000, first.journalDir);
+  const resumed = harness(first.journalDir);
   expect((await resumed.request({ messages: rebuilt }))?.messages).toEqual([
     ...loop,
     answer,
@@ -228,7 +223,7 @@ test("gives a rewritten tool result its first form back, also after a resume", a
   const rebuilt = [system, task, toolCall, elided, answer, nextPrompt];
   expect((await h.request({ messages: rebuilt }))?.messages).toEqual([...loop, nextPrompt]);
 
-  const resumed = harness(60_000, h.journalDir);
+  const resumed = harness(h.journalDir);
   expect((await resumed.request({ messages: rebuilt }))?.messages).toEqual([...loop, nextPrompt]);
 });
 
@@ -280,7 +275,7 @@ test("sends each tool call with the id Kimi writes, the same in every later requ
   ]);
 
   // The journal keeps OMP's ids, so a resumed process restores and renumbers the same way.
-  const resumed = harness(60_000, h.journalDir);
+  const resumed = harness(h.journalDir);
   expect((await resumed.request({ messages: rebuilt }))?.messages).toEqual(second);
 
   // DeepSeek has its own template: its ids go on the wire as OMP sent them.
@@ -315,7 +310,7 @@ test("keeps the first system prompt on the wire and sends a change as one notice
   const later = [rebuilt, task, toolCall, toolResult, answer, nextPrompt];
   const expected = [...wire, nextPrompt];
   expect((await h.request({ messages: later }))?.messages).toEqual(expected);
-  const resumed = harness(60_000, h.journalDir);
+  const resumed = harness(h.journalDir);
   expect((await resumed.request({ messages: later }))?.messages).toEqual(expected);
 
   // Another conversation on the same model keeps its own system prompt.
@@ -356,7 +351,7 @@ test("gives a message its removed images back, with the system prompt it was sen
   const later = [rebuilt, bare, toolCall, toolResult, answer, newShot, nextPrompt];
   const expected = [...wire, nextPrompt];
   expect((await h.request({ messages: later }))?.messages).toEqual(expected);
-  const resumed = harness(60_000, h.journalDir);
+  const resumed = harness(h.journalDir);
   expect((await resumed.request({ messages: later }))?.messages).toEqual(expected);
 });
 
@@ -372,7 +367,7 @@ test("restores each image to its own message when two messages have the same tex
   const rebuilt = [system, task, answer, bare, fixed, bare, answer, nextPrompt];
   const expected = [...loop, nextPrompt];
   expect((await h.request({ messages: rebuilt }))?.messages).toEqual(expected);
-  const resumed = harness(60_000, h.journalDir);
+  const resumed = harness(h.journalDir);
   expect((await resumed.request({ messages: rebuilt }))?.messages).toEqual(expected);
 });
 
@@ -405,7 +400,7 @@ test("keeps the first tool list on the wire and sends a change as one notice", a
   const second = await h.request(later);
   expect(second?.tools).toEqual(sent);
   expect(second?.messages).toEqual(expected);
-  const resumed = harness(60_000, h.journalDir);
+  const resumed = harness(h.journalDir);
   const afterResume = await resumed.request(later);
   expect(afterResume?.tools).toEqual(sent);
   expect(afterResume?.messages).toEqual(expected);
@@ -446,29 +441,8 @@ test("after a compaction the current system prompt goes on the wire", async () =
   const compacted = [rebuilt, task, nextPrompt];
   expect((await h.request({ messages: compacted }))?.messages).toEqual(compacted);
 
-  const resumed = harness(60_000, h.journalDir);
+  const resumed = harness(h.journalDir);
   expect((await resumed.request({ messages: compacted }))?.messages).toEqual(compacted);
-});
-
-test("the idle timer releases only while the agent is idle", async () => {
-  jest.useFakeTimers();
-  try {
-    const h = harness(1000);
-    h.state.idle = false;
-    await h.request();
-    jest.advanceTimersByTime(1500);
-    expect(h.state.releases).toBe(0);
-    h.state.idle = true;
-    jest.advanceTimersByTime(1500);
-    expect(h.state.releases).toBe(1);
-    // The timer already released the run, so shutdown must not start a second release.
-    await h.emit("session_shutdown");
-    expect(h.state.releases).toBe(1);
-    expect(requests).toHaveLength(1);
-    expect(requests[0].body.run_final).toBe(true);
-  } finally {
-    jest.useRealTimers();
-  }
 });
 
 test("logs a prefix change and a cache miss", async () => {
@@ -507,7 +481,7 @@ test("a request without a response shows its wait and the miss Morph may still c
   jest.useFakeTimers();
   try {
     setSystemTime(new Date(2026, 10, 19, 14, 0, 0));
-    const h = harness(0);
+    const h = harness();
     h.state.hasUI = true;
     const cacheStatus = "morph 0.0% cached · 408309 new · 0/24290 left";
 
@@ -546,7 +520,7 @@ test("misses queue up; past the queue a wait no longer names the limit", async (
   jest.useFakeTimers();
   try {
     setSystemTime(new Date(2026, 10, 19, 18, 32, 0));
-    const h = harness(0);
+    const h = harness();
     h.state.hasUI = true;
 
     // Without a miss, a wait shows only its length.
