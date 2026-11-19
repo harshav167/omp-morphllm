@@ -71,9 +71,24 @@ The plugin writes these records to the OMP log:
 
 A cache miss also shows as a warning in the session. The status line shows the cached share, the new tokens, and the remaining allowance.
 
+## A wait for the limit shows in the status line
+
+Morph answers a throttled request with a `429` and a `Retry-After` of at most 59 seconds. OMP retries such a `429` without a sign, up to five times, within the 300-second wait for the first response. A request that Morph refuses therefore looks like a slow request.
+
+When a Morph request has no response after 20 seconds, the status line shows the wait and updates every 10 seconds:
+
+```text
+morph: no response for 1m20s · likely uncached-token limit · up to 12m left (408,309-token miss at 14:02)
+```
+
+The time comes from the large misses of the process, which have 16,384 or more uncached tokens. Each miss adds its tokens divided by the per-minute limit, after the misses before it. Morph charged a miss at once, several requests later, or not at all. In the logs of 15 to 18 November, 38 waits started within this time, and each ended before this time plus OMP's 60-second retry interval. After that point the notice shows only the wait. Several misses show as `2 misses since 18:32, 724,880 tokens`.
+
+The warning for a cache miss also says how long Morph may block requests.
+
 ## What the plugin does not handle
 
 - **The system notice is a user message.** Until the next compaction, the model reads a changed instruction as a notice and not as system prompt.
+- **A wait for the limit.** OMP still retries a `429` without a sign; the plugin only shows the wait. Another OMP process on the same Morph account can cause a wait that this process does not attribute to a miss.
 - **A new tool.** A new tool, or new parameters for a tool, make one request uncached. The log shows `Morph request prefix changed`.
 - **A compaction.** A compaction replaces the history, so the first request after it is uncached. OMP can do a compaction when it starts a session again.
 - **Agent Runs on Kimi K3.** Morph documents Agent Runs for Kimi K3.1. The plugin also sends the `run_id` with Kimi K3 requests.

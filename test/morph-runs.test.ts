@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, expect, jest, test } from "bun:test";
+import { afterEach, beforeEach, expect, jest, setSystemTime, test } from "bun:test";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { createMorphRunsExtension } from "../src/morph-runs";
 
@@ -35,11 +35,19 @@ function harness(
   const handlers = new Map<string, Handler[]>();
   const warnings: unknown[][] = [];
   // `releases` counts started releases: a release reads the credential before it sends.
-  const state = { owner: "session-a", idle: true, releases: 0 };
+  const state = { owner: "session-a", idle: true, releases: 0, hasUI: false };
+  const statuses: (string | undefined)[] = [];
+  const notices: string[] = [];
   const model = { provider: "morph", id: "morph-kimik31", baseUrl: "https://api.morphllm.com/v1" };
   const ctx = {
     model,
-    hasUI: false,
+    get hasUI() {
+      return state.hasUI;
+    },
+    ui: {
+      setStatus: (_key: string, text: string | undefined) => statuses.push(text),
+      notify: (text: string) => notices.push(text),
+    },
     modelRegistry: {
       getApiKey: async () => {
         state.releases++;
@@ -83,7 +91,7 @@ function harness(
   const request = (extra?: RecordValue) =>
     emit("before_provider_request", { payload: payload(extra) });
 
-  return { ctx, state, warnings, emit, payload, request, journalDir };
+  return { ctx, state, warnings, statuses, notices, emit, payload, request, journalDir };
 }
 
 test("tags every Kimi request of a session with one run id derived from the session", async () => {
@@ -479,4 +487,99 @@ test("logs a prefix change and a cache miss", async () => {
   expect(h.warnings).toHaveLength(1);
   await usage(50_400, 0);
   expect(h.warnings[1]?.[0]).toBe("Morph cache miss");
+});
+
+type Emitter = { emit: (name: string, event?: RecordValue) => Promise<RecordValue | undefined> };
+const respondUltra = (h: Emitter) =>
+  h.emit("after_provider_response", {
+    status: 200,
+    headers: {
+      "x-morph-ultra-uncached-input-limit": "24290",
+      "x-morph-ultra-uncached-input-remaining": "0",
+    },
+  });
+const endTurn = (h: Emitter, input: number, cacheRead: number) =>
+  h.emit("message_end", {
+    message: { role: "assistant", provider: "morph", usage: { input, cacheRead, output: 10 } },
+  });
+
+test("a request without a response shows its wait and the miss Morph may still charge", async () => {
+  jest.useFakeTimers();
+  try {
+    setSystemTime(new Date(2026, 10, 19, 14, 0, 0));
+    const h = harness(0);
+    h.state.hasUI = true;
+    const cacheStatus = "morph 0.0% cached · 408309 new · 0/24290 left";
+
+    // An ordinary turn, then a cache miss of 408,309 tokens at 14:02.
+    await h.request();
+    await respondUltra(h);
+    await endTurn(h, 1_000, 50_000);
+    jest.advanceTimersByTime(120_000);
+    await h.request();
+    await respondUltra(h);
+    await endTurn(h, 408_309, 0);
+    expect(h.notices.at(-1)).toEndWith(". Morph may block requests for up to 17 min");
+
+    // At 14:06 a request gets no response. The notice starts at 20 s and updates.
+    jest.advanceTimersByTime(240_000);
+    await h.request();
+    jest.advanceTimersByTime(10_000);
+    expect(h.statuses.at(-1)).toBe(cacheStatus);
+    jest.advanceTimersByTime(70_000);
+    expect(h.statuses.at(-1)).toBe(
+      "morph: no response for 1m20s · likely uncached-token limit · up to 12m left (408,309-token miss at 14:02)",
+    );
+
+    // The response puts the cache status back, and the notice stops.
+    await respondUltra(h);
+    expect(h.statuses.at(-1)).toBe(cacheStatus);
+    jest.advanceTimersByTime(30_000);
+    expect(h.statuses.at(-1)).toBe(cacheStatus);
+  } finally {
+    jest.useRealTimers();
+    setSystemTime();
+  }
+});
+
+test("misses queue up; past the queue a wait no longer names the limit", async () => {
+  jest.useFakeTimers();
+  try {
+    setSystemTime(new Date(2026, 10, 19, 18, 32, 0));
+    const h = harness(0);
+    h.state.hasUI = true;
+
+    // Without a miss, a wait shows only its length.
+    await h.request();
+    jest.advanceTimersByTime(20_000);
+    expect(h.statuses.at(-1)).toBe("morph: no response for 20s");
+    await respondUltra(h);
+
+    // Two misses at 18:32:20 are paid one after the other: until 19:02:11.
+    await endTurn(h, 362_107, 0);
+    await h.request();
+    await respondUltra(h);
+    await endTurn(h, 362_773, 0);
+    expect(h.notices.at(-1)).toEndWith(". Morph may block requests for up to 30 min");
+
+    await h.request();
+    jest.advanceTimersByTime(30_000);
+    expect(h.statuses.at(-1)).toBe(
+      "morph: no response for 30s · likely uncached-token limit · up to 30m left (2 misses since 18:32, 724,880 tokens)",
+    );
+    // After the queue ends, OMP may still be in its last quiet retry for up to 60 s.
+    jest.advanceTimersByTime(1_780_000);
+    expect(h.statuses.at(-1)).toBe(
+      "morph: no response for 30m10s · likely uncached-token limit (2 misses since 18:32, 724,880 tokens)",
+    );
+    jest.advanceTimersByTime(50_000);
+    expect(h.statuses.at(-1)).toBe("morph: no response for 31m00s");
+
+    // The end of the turn stops the notice and puts the cache status back.
+    await h.emit("agent_end");
+    expect(h.statuses.at(-1)).toBe("morph 0.0% cached · 362773 new · 0/24290 left");
+  } finally {
+    jest.useRealTimers();
+    setSystemTime();
+  }
 });

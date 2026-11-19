@@ -38,14 +38,21 @@ On 10 November the published limit was 72,870 tokens per minute. The same reques
 
 An `x-morph-execution-region` request header has no effect. The region names do not resolve as host names. Morph documents placement by `x-session-id` and by `run_id` as best effort.
 
-## A throttled request can wait without an answer
+## A throttled request looks like a slow request
 
-Some throttled requests waited about 300 seconds and received no response headers. Other throttled requests received a `429` with `Retry-After`.
+Morph answers a throttled request with a `429` and a `Retry-After` of at most 59 seconds. The body gives only the limit: `Limit: 24290 uncached input tokens/minute`. OMP 19.0.0 retries a `429` without a sign when `Retry-After` is 60 seconds or less (`fetchWithRetry` in `@oh-my-pi/pi-utils`), up to five times, within the 300-second wait for the first response. The waits of about 300 seconds without response headers were these retries. Only the last `429` of a series reaches the OMP log, as `agent turn ended with provider error`.
 
-The cause is an inference from timing. Each long wait occurred when the uncached allowance was short.
+## Morph charges a large miss at different times
+
+In the OMP logs of 15 to 18 November, 44 requests had more uncached tokens than the per-minute allowance and the burst together (97,160). After 23 of them the next request waited for a time that fits the miss. After one, the wait of 1,551 seconds followed three misses in 22 seconds. After 17 of them Morph admitted the next request within 120 seconds. After the other 3 the session was idle for hours.
+
+- Some misses caused a wait several requests later. A miss of 470,139 tokens on 16 November caused a wait of 1,110 seconds nine requests later.
+- Some misses caused no wait. After a miss of 427,780 tokens on 16 November, 27 requests in the next 30 minutes had no wait.
+
+When a wait came at once, it lasted a median of 0.92, and at most 1.0, of the miss divided by 24,290 tokens per minute (23 waits). The limit headers do not show the debt: `x-morph-ultra-uncached-input-remaining` stops at 0.
 
 ## What helps
 
 - A way to pin a run to a region or a worker.
 - No charge against the uncached limit for a prefill that a region move caused.
-- A `429` with `Retry-After` at once when the limit throttles a request.
+- A `Retry-After` that gives the real wait. Above 60 seconds, OMP passes the `429` to the session at once instead of retrying it without a sign.

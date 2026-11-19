@@ -10,6 +10,9 @@ const RELEASE_TIMEOUT_MS = 1500; // session_shutdown handlers have a 2s budget.
 const IDLE_RELEASE_MS = 10 * 60_000; // Morph reclaims an idle run by itself at 15 minutes.
 const CACHE_MISS_MIN_TOKENS = 16_384; // Below this an uncached input is an ordinary new turn.
 const CACHE_MISS_SHARE_MARGIN = 0.25; // Cached share may fall this far below the expected share.
+const STALL_NOTICE_MS = 20_000; // A Morph request without a response this long gets a notice.
+const STALL_REFRESH_MS = 10_000; // How often the notice updates its times.
+const RETRY_INTERVAL_MS = 60_000; // OMP retries a 429 quietly when Retry-After is at most this.
 const MAX_HISTORIES = 3; // Sent histories kept per model: the main loop plus side requests.
 const MAX_CONVERSATIONS = 8; // First-sent system prompts kept; side requests add entries.
 const NOTICE_OPEN = '<system-notice source="morph-runs">';
@@ -165,6 +168,58 @@ function withKimiToolCallIds(messages: readonly unknown[]): unknown[] | undefine
 function headerNumber(headers: Record<string, string>, name: string): number | undefined {
   const value = Number(headers[name]);
   return Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Uncached input that Morph may still charge against its per-minute limit: `tokens` from
+ * `misses` large misses since `since`. Morph can let a request through after the allowance is
+ * spent and refuse later requests until the debt is paid. It does so right away, several
+ * requests later, or not at all. Paid at the limit one after another, the misses are paid by
+ * `until` (epoch ms) at the latest.
+ */
+type Debt = { until: number; tokens: number; misses: number; since: number };
+
+/** Adds a miss of `uncached` tokens to an open debt, or starts a new debt. */
+function addMiss(debt: Debt | undefined, uncached: number, limit: number, now: number): Debt {
+  const open = debt !== undefined && debt.until > now;
+  return {
+    until: (open ? debt.until : now) + (uncached / limit) * 60_000,
+    tokens: (open ? debt.tokens : 0) + uncached,
+    misses: (open ? debt.misses : 0) + 1,
+    since: open ? debt.since : now,
+  };
+}
+
+function minutesLeft(debt: Debt, now: number): number {
+  return Math.ceil((debt.until - now) / 60_000);
+}
+
+/** `1m20s`, `45s`. */
+function duration(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  return minutes > 0 ? `${minutes}m${String(seconds % 60).padStart(2, "0")}s` : `${seconds}s`;
+}
+
+/** Local `HH:MM`. */
+function clock(ms: number): string {
+  return new Date(ms).toTimeString().slice(0, 5);
+}
+
+/**
+ * The status of a Morph request that has waited `waitedMs` for its response. OMP retries a 429
+ * without a sign, so a request that Morph refuses only looks slow.
+ */
+function stallText(waitedMs: number, debt: Debt | undefined, now: number): string {
+  const text = `morph: no response for ${duration(waitedMs)}`;
+  if (!debt || now >= debt.until + RETRY_INTERVAL_MS) return text;
+  const tokens = debt.tokens.toLocaleString("en-US");
+  const source =
+    debt.misses === 1
+      ? `${tokens}-token miss at ${clock(debt.since)}`
+      : `${debt.misses} misses since ${clock(debt.since)}, ${tokens} tokens`;
+  const left = debt.until > now ? ` · up to ${minutesLeft(debt, now)}m left` : "";
+  return `${text} · likely uncached-token limit${left} (${source})`;
 }
 
 /**
@@ -459,6 +514,10 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
     let assistantTurns = 0;
     let prefixChangedSinceUsage = false;
     let expectedCachedShare: number | undefined;
+    let debt: Debt | undefined;
+    let stallTimer: Timer | undefined;
+    let stallShown = false;
+    let usageStatus: string | undefined;
     const prefixes = new Map<string, { system: string; tools: string }>();
     const histories = new Map<string, string[][]>();
     const drops: Drop[] = [];
@@ -475,8 +534,33 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
       idleTimer = undefined;
     };
 
-    const showStatus = (ctx: ExtensionContext, text: string): void => {
+    const showStatus = (ctx: ExtensionContext, text: string | undefined): void => {
       if (ctx.hasUI) ctx.ui.setStatus("morph", text);
+    };
+
+    const clearStallTimer = (): void => {
+      if (stallTimer === undefined) return;
+      clearInterval(stallTimer);
+      stallTimer = undefined;
+    };
+
+    const startWaiting = (ctx: ExtensionContext): void => {
+      clearStallTimer();
+      const since = Date.now();
+      stallTimer = setInterval(() => {
+        const now = Date.now();
+        if (now - since < STALL_NOTICE_MS) return;
+        stallShown = true;
+        showStatus(ctx, stallText(now - since, debt, now));
+      }, STALL_REFRESH_MS);
+      stallTimer.unref?.();
+    };
+
+    const stopWaiting = (ctx: ExtensionContext): void => {
+      clearStallTimer();
+      if (!stallShown) return;
+      stallShown = false;
+      showStatus(ctx, usageStatus);
     };
 
     const forget = (): void => {
@@ -890,6 +974,7 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
 
     const releaseNow = async (): Promise<void> => {
       clearIdleTimer();
+      clearStallTimer();
       prefixes.clear();
       assistantTurns = 0;
       prefixChangedSinceUsage = false;
@@ -916,6 +1001,7 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
       if (!isMorph(model)) return;
       const body = asBody(event.payload);
       if (!body || typeof body.model !== "string") return;
+      startWaiting(ctx);
       const owner = ctx.sessionManager.getSessionId();
 
       let next = body;
@@ -998,15 +1084,14 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
         requestId: event.requestId,
         headers,
       });
-      if (event.status === 429) {
-        showStatus(ctx, `morph 429 · retry after ${headers["retry-after"] ?? "?"}s`);
-      }
+      stopWaiting(ctx);
     });
 
     pi.on("message_end", (event, ctx) => {
       const message = event.message;
-      if (message?.role !== "assistant" || message.provider !== MORPH_PROVIDER || !message.usage)
-        return;
+      if (message?.role !== "assistant" || message.provider !== MORPH_PROVIDER) return;
+      stopWaiting(ctx);
+      if (!message.usage) return;
       const cached = message.usage.cacheRead ?? 0;
       const uncached = message.usage.input ?? 0;
       const total = cached + uncached;
@@ -1037,18 +1122,32 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
       if (cacheMiss) pi.logger.warn("Morph cache miss", record);
       else pi.logger.info("Morph usage", record);
 
+      // A large uncached input can leave Morph's allowance in debt (see `Debt`).
+      const now = Date.now();
+      if (uncached >= CACHE_MISS_MIN_TOKENS && quota.limit !== undefined && quota.limit > 0) {
+        debt = addMiss(debt, uncached, quota.limit, now);
+      }
       const left =
         quota.remaining === undefined ? "" : ` · ${quota.remaining}/${quota.limit ?? "?"} left`;
-      showStatus(ctx, `morph ${(cachedShare * 100).toFixed(1)}% cached · ${uncached} new${left}`);
+      usageStatus = `morph ${(cachedShare * 100).toFixed(1)}% cached · ${uncached} new${left}`;
+      stallShown = false;
+      showStatus(ctx, usageStatus);
       if (cacheMiss && ctx.hasUI) {
+        const block =
+          debt && debt.until > now
+            ? `. Morph may block requests for up to ${minutesLeft(debt, now)} min`
+            : "";
         ctx.ui.notify(
-          `Morph cache miss: ${uncached} uncached input tokens, ${cached} cached${record.prefixChanged ? " (request prefix changed)" : ""}`,
+          `Morph cache miss: ${uncached} uncached input tokens, ${cached} cached${record.prefixChanged ? " (request prefix changed)" : ""}${block}`,
           "warning",
         );
       }
     });
 
-    pi.on("agent_end", (_event, ctx) => armIdleRelease(ctx));
+    pi.on("agent_end", (_event, ctx) => {
+      stopWaiting(ctx);
+      armIdleRelease(ctx);
+    });
 
     // After a compaction OMP sends a new history on purpose. Nothing that was sent before
     // applies to it, and the current system prompt goes on the wire.
