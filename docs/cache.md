@@ -34,6 +34,14 @@ The plugin writes each change to a journal at `<agent dir>/cache/morph-wire/<ses
 
 As a result, the cache stays valid when you stop a turn, steer the agent, rewind, or branch.
 
+## Tool calls carry the ids that Kimi writes
+
+Kimi's chat template shows the model a past tool call only by its id, and a tool result only by the id of its call. The model writes the id of a new call as `functions.<name>:<index>`, where the index counts the calls of the conversation from 0. Morph returns other ids, for example `call-<uuid>`.
+
+The plugin sends every tool call of a Kimi request with the id that the model would have written, and every tool result with the id of its call. The index of a call depends only on the messages before it, so a call keeps its id in every later request and the cached prefix stays valid. A compaction starts the count again.
+
+The change applies to the request on the wire only. The OMP session, the sent histories, and the journal keep the ids that Morph returned. A tool result whose call is not in the request keeps its id. DeepSeek requests keep their ids.
+
 ## The system prompt and the tool list keep their bytes
 
 OMP builds the system prompt and the tool list again during a session. For example, an MCP server connects and the list of mounted devices becomes longer, or a mode ends and its tool goes away. The system prompt and the tool list are the first part of the request, so one changed line makes the full request uncached.
@@ -69,11 +77,14 @@ A cache miss also shows as a warning in the session. The status line shows the c
 - **A new tool.** A new tool, or new parameters for a tool, make one request uncached. The log shows `Morph request prefix changed`.
 - **A compaction.** A compaction replaces the history, so the first request after it is uncached. OMP can do a compaction when it starts a session again.
 - **Agent Runs on Kimi K3.** Morph documents Agent Runs for Kimi K3.1. The plugin also sends the `run_id` with Kimi K3 requests.
+- **The first request after an update to the Kimi tool-call ids.** In a session that started before the update, the ids of the earlier tool calls change, so that request is uncached from its first tool call.
 
 ## What the tests cover
 
 The provider, the request settings, and the log records ran against Morph through `omp` 18.20.2.
 
 Tests and replays of captured requests cover the history restore, the image restore, and the freeze of the system prompt and the tool list. A replay of 450 requests from a session on 16 November had 31 requests with a changed history. With the image restore, each request continued the bytes of the request before it. No live session used the image restore or the tool-list freeze yet.
+
+On 18 November a direct request to `morph-kimik31` with a tool call and its result under the id `functions.read:0` returned HTTP 200, and the model answered from the tool result.
 
 Tests cover the login function. The OMP login screen did not run it yet.

@@ -39,6 +39,7 @@ Each model accepts text and images and has a context window of 1,048,576 tokens.
 - **It pins every request setting for Morph.** OMP selects many request details from the model name, so a model named "Kimi" gets Moonshot's rules. Morph serves the weights on its own stack.
 - **It keeps each session on one worker.** Every Kimi request of a session carries one Morph `run_id`.
 - **It keeps the request prefix byte-stable.** When you stop a turn, connect a new tool server, or let the model read an image, OMP changes bytes that it already sent. The plugin sends the original bytes.
+- **It gives each tool call the id that Kimi writes.** Kimi sees a past tool call only by its id. Morph returns ids such as `call-<uuid>`; the plugin sends `functions.<name>:<index>`, the form that the model itself writes.
 - **It reports the cache on every response.** The OMP log gets the cached and uncached tokens, the Ultra limit headers, and the execution region. A cache miss shows as a warning in the session.
 
 In a session on 15 November, Morph served 99.0% of 172 million input tokens from the cache.

@@ -143,12 +143,15 @@ test("a branch keeps the run id of the conversation it continues", async () => {
 
 const system = { role: "system", content: "stable system prompt" };
 const task = { role: "user", content: "task" };
+// The tool call is in the form Kimi gives it on the wire, which the id rewrite keeps.
 const toolCall = {
   role: "assistant",
   content: null,
-  tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: "{}" } }],
+  tool_calls: [
+    { id: "functions.read:0", type: "function", function: { name: "read", arguments: "{}" } },
+  ],
 };
-const toolResult = { role: "tool", tool_call_id: "c1", content: "file text" };
+const toolResult = { role: "tool", tool_call_id: "functions.read:0", content: "file text" };
 const interrupted = { role: "assistant", content: "partial reply", reasoning_content: "plan" };
 const interjection = { role: "user", content: "interjection" };
 const answer = { role: "assistant", content: "answer" };
@@ -219,6 +222,62 @@ test("gives a rewritten tool result its first form back, also after a resume", a
 
   const resumed = harness(60_000, h.journalDir);
   expect((await resumed.request({ messages: rebuilt }))?.messages).toEqual([...loop, nextPrompt]);
+});
+
+const calls = (...entries: [id: string, name: string][]) => ({
+  role: "assistant",
+  content: null,
+  tool_calls: entries.map(([id, name]) => ({
+    id,
+    type: "function",
+    function: { name, arguments: "{}" },
+  })),
+});
+const result = (id: string) => ({ role: "tool", tool_call_id: id, content: "out" });
+
+test("sends each tool call with the id Kimi writes, the same in every later request", async () => {
+  const h = harness();
+  const loop = [
+    system,
+    task,
+    calls(["call-a", "read"]),
+    result("call-a"),
+    interrupted,
+    interjection,
+  ];
+  const first = (await h.request({ messages: loop }))?.messages as RecordValue[];
+  expect(first[2]).toEqual(calls(["functions.read:0", "read"]));
+  expect(first[3]).toEqual(result("functions.read:0"));
+
+  // The next request drops the interrupted reply, adds a turn with two calls, and carries a
+  // tool result whose call is not in the request.
+  const rebuilt = [
+    system,
+    task,
+    calls(["call-a", "read"]),
+    result("call-a"),
+    interjection,
+    calls(["call-b", "bash"], ["call-c", "read"]),
+    result("call-b"),
+    result("call-c"),
+    result("call-gone"),
+  ];
+  const second = (await h.request({ messages: rebuilt }))?.messages as RecordValue[];
+  expect(second.slice(0, first.length)).toEqual(first);
+  expect(second.slice(first.length)).toEqual([
+    calls(["functions.bash:1", "bash"], ["functions.read:2", "read"]),
+    result("functions.bash:1"),
+    result("functions.read:2"),
+    result("call-gone"),
+  ]);
+
+  // The journal keeps OMP's ids, so a resumed process restores and renumbers the same way.
+  const resumed = harness(60_000, h.journalDir);
+  expect((await resumed.request({ messages: rebuilt }))?.messages).toEqual(second);
+
+  // DeepSeek has its own template: its ids go on the wire as OMP sent them.
+  const flash = harness();
+  expect(await flash.request({ model: "morph-dsv41flash", messages: loop })).toBeUndefined();
 });
 
 test("a compaction starts a new history", async () => {

@@ -19,8 +19,8 @@ const NOTICE_PREFIX = JSON.stringify({ role: "user", content: NOTICE_OPEN }).sli
 const IMAGE_OMITTED = "[image omitted: provider image limit]";
 /** How the tool list starts as the last item of a first-sent prefix. */
 const TOOLS_ITEM = "tools:";
-/** The models whose requests carry a run id: the Kimi models of the Ultra plan. */
-const RUN_MODELS: Record<string, true> = { "morph-kimik31": true, "morph-kimik3": true };
+/** The Kimi models of the Ultra plan: their requests carry a run id and Kimi tool-call ids. */
+const KIMI_MODELS: Record<string, true> = { "morph-kimik31": true, "morph-kimik3": true };
 
 type Body = Record<string, unknown>;
 
@@ -118,6 +118,48 @@ function prefixHashes(body: Body): { system: string; tools: string } {
     system.push(message);
   }
   return { system: fingerprint(system), tools: fingerprint(body.tools ?? null) };
+}
+
+/**
+ * Kimi's chat template shows the model a past tool call only by its id, and the model writes
+ * the id of a new call as `functions.{name}:{index}`, where the index counts the calls of the
+ * conversation from 0. Morph answers with opaque ids such as `call-<uuid>`, so each call goes
+ * on the wire with the id that the model would have written, and each tool result with the id
+ * of its call. An index depends only on the messages before it, so a call keeps its id in
+ * every later request. A tool result whose call is not in the request keeps its id. Returns
+ * undefined when no id changes.
+ */
+function withKimiToolCallIds(messages: readonly unknown[]): unknown[] | undefined {
+  const ids = new Map<string, string>();
+  let index = 0;
+  let changed = false;
+  const wire = messages.map((message) => {
+    const body = asBody(message);
+    if (body?.role === "assistant" && Array.isArray(body.tool_calls)) {
+      let callsChanged = false;
+      const calls = body.tool_calls.map((call) => {
+        const entry = asBody(call);
+        const name = asBody(entry?.function)?.name;
+        if (typeof entry?.id !== "string" || typeof name !== "string") return call;
+        const id = `functions.${name}:${index++}`;
+        ids.set(entry.id, id);
+        if (id === entry.id) return call;
+        callsChanged = true;
+        return { ...entry, id };
+      });
+      if (!callsChanged) return message;
+      changed = true;
+      return { ...body, tool_calls: calls };
+    }
+    if (body?.role === "tool" && typeof body.tool_call_id === "string") {
+      const id = ids.get(body.tool_call_id);
+      if (id === undefined || id === body.tool_call_id) return message;
+      changed = true;
+      return { ...body, tool_call_id: id };
+    }
+    return message;
+  });
+  return changed ? wire : undefined;
 }
 
 function headerNumber(headers: Record<string, string>, name: string): number | undefined {
@@ -882,6 +924,11 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
         if (restored.messages) next = { ...next, messages: restored.messages };
         if (restored.tools) next = { ...next, tools: restored.tools };
       }
+      // The sent histories keep OMP's ids, so this rewrite applies to the wire copy only.
+      if (Object.hasOwn(KIMI_MODELS, body.model) && Array.isArray(next.messages)) {
+        const messages = withKimiToolCallIds(next.messages);
+        if (messages) next = { ...next, messages };
+      }
 
       // This reports what goes on the wire. A side request with its own system prompt or
       // tool list also reports a change: judge it by the cached tokens of the next response.
@@ -900,7 +947,7 @@ export function createMorphRunsExtension(options?: MorphRunsOptions): (pi: Exten
 
       // Caller-owned run fields, including the ThunderAgent aliases, stay as they are.
       const tagged =
-        Object.hasOwn(RUN_MODELS, body.model) &&
+        Object.hasOwn(KIMI_MODELS, body.model) &&
         !("run_id" in body) &&
         !("program_id" in body) &&
         body.run_final !== true &&
